@@ -30,15 +30,23 @@ exports.load_dovecot_ini = function () {
 
 };
 
+exports.advertise_auth = function(next, connection, methods) {
+        if (methods && methods.length > 1) {
+           connection.capabilities.push('AUTH ' + methods.join(' '));
+           connection.notes.allowed_auth_methods = methods;
+        }
+        next();
+};
+
 exports.hook_capabilities = function (next, connection) {
     var plugin = this;
+    var methods = [];
 
-    var methods = ['PLAIN', 'LOGIN'];
-    if (methods && methods.length > 0) {
-        connection.capabilities.push('AUTH ' + methods.join(' '));
-        connection.notes.allowed_auth_methods = methods;
+    if (!server.notes.dovecot_auth_methods) {
+        plugin.get_dovecot_auth_methods(next, connection, plugin.advertise_auth);
+    } else {
+        plugin.advertise_auth(next, connection, server.notes.dovecot_auth_methods);
     }
-    next();
 };
 
 exports.auth_plain = function(next, connection, params) {
@@ -67,6 +75,26 @@ exports.auth_login = function(next, connection, params) {
     connection.respond(334, LOGIN_STRING1, function () {
         connection.notes.auth_login_asked_login = true;
         return next(OK);
+    });
+};
+
+exports.get_dovecot_auth_methods = function(next, connection, advertise_auth) {
+    var plugin = this;
+    var methods = [];
+    var socket = new sock.Socket();
+    socket.connect(plugin.cfg.main.port, plugin.cfg.main.hostname);
+
+    socket.on('line', function(line) {
+        var res = line.split('\t');
+        switch(res[0].trim()) {
+           case 'MECH':
+               methods.push(res[1]);
+               break;
+           case 'DONE':
+               server.notes.dovecot_auth_methods = methods;
+               return advertise_auth(next, connection, methods);
+               break;
+        }
     });
 };
 
