@@ -80,6 +80,7 @@ exports.auth_login = function(next, connection, params) {
 
 exports.get_dovecot_auth_methods = function(next, connection, advertise_auth) {
     var plugin = this;
+    var version;
     var methods = [];
     var socket = new sock.Socket();
     socket.connect(plugin.cfg.main.port, plugin.cfg.main.hostname);
@@ -90,7 +91,15 @@ exports.get_dovecot_auth_methods = function(next, connection, advertise_auth) {
            case 'MECH':
                methods.push(res[1]);
                break;
+           case 'VERSION':
+               version = res[1] + '.' + res[2];
+               break;
            case 'DONE':
+               if (version != 1.1) {
+                   connection.logerror('Got wrong protocol version from Dovecot: ' + version);
+                   methods = [];
+                   break;
+               }
                server.notes.dovecot_auth_methods = methods;
                return advertise_auth(next, connection, methods);
                break;
@@ -100,39 +109,13 @@ exports.get_dovecot_auth_methods = function(next, connection, advertise_auth) {
 
 exports.try_dovecot_auth = function(next, connection, params, scheme) {
     var plugin = this;
-    var found_scheme = false;
-    var headers = {
-        mech: {},
-    };
     var socket = new sock.Socket();
     socket.connect(plugin.cfg.main.port, plugin.cfg.main.hostname);
 
     socket.on('line', function(line) {
         var res = line.split('\t');
         switch(res[0].trim()) {
-           case 'VERSION':
-               headers.version = res[1] + '.' + res[2];
-               break;
-           case 'MECH':
-               if (res[1] == scheme) {
-                   found_scheme = true;
-               }
-               break;
            case 'DONE':
-               if (!found_scheme) {
-                   connection.logerror('Dovecot cant support requested scheme');
-                   connection.respond(535, 'Cannot authenticate', function() {
-                       return next(OK);
-                   });
-                   break;
-               }
-               if (headers.version != 1.1) {
-                   connection.logerror('Got wrong protocol version from Dovecot: ' + headers.version);
-                   connection.respond(535, 'Cannot authenticate', function() {
-                       return next(OK);
-                   });
-                   break;
-               }
                socket.write('VERSION\t1\t1\nCPID\t'+process.pid+'\n');
                switch (scheme) {
                    case 'PLAIN':
