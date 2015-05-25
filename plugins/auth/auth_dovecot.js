@@ -120,10 +120,24 @@ exports.hook_unrecognized_command = function (next, connection, params) {
                });
                break;
            case 'OK':
-               connection.respond(235, 'Authentication successful', function() {
-                   connection.notes.authenticating = false;
-                   socket.end();
-               });
+               if (res[2]) {
+                   var username = res[2].split('=')[1];
+               }
+               if (username) {
+                   connection.respond(235, 'Authentication successful', function() {
+                       connection.notes.auth_user = username;
+                       connection.notes.authenticating = false;
+                       socket.end();
+                   });
+               } else {
+                    connection.logerror('Authenticated OK but couldnt get username - failing auth');
+                    connection.respond(535, 'Cannot authenticate', function() {
+                        connection.notes.authenticating = false;
+                        connection.reset_transaction(function() {
+                            socket.end();
+                        });
+                    });
+               }
                break;
            case 'FAIL':
                connection.respond(535, 'Authentication failed', function() {
