@@ -67,7 +67,7 @@ exports.get_methods = function(next, connection, advertise_auth) {
                    connection.logerror('Got wrong protocol version from Dovecot: ' + version);
                    methods = [];
                }
-               server.notes.dovecot_auth_methods = methods;
+               server.notes.dovecot_auth_methods = methods.sort();
                socket.end();
                return advertise_auth(next, connection, methods);
         }
@@ -104,16 +104,45 @@ exports.hook_unrecognized_command = function (next, connection, params) {
         delete(plugin.pool[connection.uuid]);
     });
 
+    var version;
+    var methods = [];
+
     socket.on('line', function(line) {
         var res = line.split('\t');
         switch(res[0].trim()) {
            case 'DONE':
-               socket.write('VERSION\t1\t1\nCPID\t'+process.pid+'\n');
-               socket.write('AUTH\t1\t'+split[0]+'\tservice='+plugin.cfg.main.service+'\tsecured');
-               if(split.length === 2) {
-                   socket.write('\tresp='+split[1]);
+               if (version != 1.1) {
+                    connection.logerror('Got wrong version number from Dovecot');
                }
-               socket.write('\n');
+               var found_method = false;
+               methods.forEach(function(method) {
+                   if (split[0] == method) {
+                       found_method = true;
+                   }
+               });
+               if (!found_method) {
+                   connection.logerror('Client tried unsupported auth scheme: ' + split[0]);
+               }
+               methods = methods.sort();
+               if (methods != server.notes.dovecot_auth_methods) {
+                   connection.loginfo('Change in Dovecot auth methods detected- refreshing');
+                   server.notes.dovecot_auth_methods = methods;
+               }
+               if((version != 1.1) || (!found_method)) {
+                   connection.respond(535, 'Cannot authenticate', function() {
+                        connection.notes.authenticating = false;
+                        connection.reset_transaction(function() {
+                            socket.end();
+                        });
+                    });
+               } else {
+                   socket.write('VERSION\t1\t1\nCPID\t'+process.pid+'\n');
+                   socket.write('AUTH\t1\t'+split[0]+'\tservice='+plugin.cfg.main.service+'\tsecured');
+                   if(split.length === 2) {
+                       socket.write('\tresp='+split[1]);
+                   }
+                   socket.write('\n');
+               }
                break;
            case 'CONT':
                connection.respond(334, res[2], function () {
@@ -146,6 +175,12 @@ exports.hook_unrecognized_command = function (next, connection, params) {
                        socket.end();
                    });
                });
+               break;
+           case 'MECH':
+               methods.push(res[1]);
+               break;
+           case 'VERSION':
+               version = res[1] + '.' + res[2];
                break;
            default:
                break;
