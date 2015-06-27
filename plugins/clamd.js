@@ -1,13 +1,11 @@
 // clamd
 
 var sock = require('./line_socket');
-
-exports.wildcard_to_regexp = function (str) {
-    return str.replace(/[-\[\]\/{}()*+?.,\\^$|#\s]/g, "\\$&").replace(/\\\*/g, '.*').replace(/\\\?/g, '.') + '$';
-};
+var utils = require('./utils');
 
 exports.load_excludes = function() {
     var plugin = this;
+
     plugin.loginfo('Loading excludes file');
     var list = plugin.config.get('clamd.excludes','list', function () {
         plugin.load_excludes();
@@ -17,7 +15,9 @@ exports.load_excludes = function() {
     var new_skip_list = [];
     for (var i=0; i < list.length; i++) {
         var re;
-        if (list[i][0] === '!') {
+        switch (list[i][0]) {
+        case '!':
+
             if (list[i][1] === '/') {
                 // Regexp exclude
                 try {
@@ -31,15 +31,16 @@ exports.load_excludes = function() {
             else {
                 // Wildcard exclude
                 try {
-                    re = new RegExp(plugin.wildcard_to_regexp(list[i].substr(1)),'i');
+                    re = new RegExp(
+                            utils.wildcard_to_regexp(list[i].substr(1)),'i');
                     new_skip_list_exclude.push(re);
                 }
                 catch (e) {
                     plugin.logerror(e.message + ' (entry: ' + list[i] + ')');
                 }
             }
-        }
-        else if (list[i][0] === '/') {
+            break;
+        case '/':
             // Regexp skip
             try {
                 re = new RegExp(list[i].substr(1, list[i].length-2),'i');
@@ -48,11 +49,11 @@ exports.load_excludes = function() {
             catch (e) {
                 plugin.logerror(e.message + ' (entry: ' + list[i] + ')');
             }
-        }
-        else {
+            break;
+        default:
             // Wildcard skip
             try {
-                re = new RegExp(plugin.wildcard_to_regexp(list[i]),'i');
+                re = new RegExp(utils.wildcard_to_regexp(list[i]),'i');
                 new_skip_list.push(re);
             }
             catch (e) {
@@ -68,12 +69,31 @@ exports.load_excludes = function() {
 
 exports.load_clamd_ini = function() {
     var plugin = this;
+
     plugin.cfg = plugin.config.get('clamd.ini', {
         booleans: [
             '-main.randomize_host_order',
             '-main.only_with_attachments',
+            '+reject.virus',
+            '+reject.error',
+
+            // clamd options that are disabled by default. If admin enables
+            // them for clamd, Haraka should reject by default.
+            '+reject.Broken.Executable',
+            '+reject.Structured',     // DLP options
+            '+reject.Encrypted',
+            '+reject.PUA',
+            '+reject.OLE2',
+            '+reject.Safebrowsing',
+            '+reject.UNOFFICIAL',
+
+            // clamd.conf options enabled by default, but prone to false
+            // positives.
+            '-reject.Phishing',
         ],
-    }, plugin.load_clamd_ini);
+    }, function () {
+        plugin.load_clamd_ini();
+    });
 
     var defaults = {
         clamd_socket: 'localhost:3310',
@@ -88,9 +108,34 @@ exports.load_clamd_ini = function() {
         }
     }
 
+    var rejectPatterns = {
+        'Broken.Executable': '^Broken\\.Executable\\.?',
+        Encrypted:           '^Encrypted\\.',
+        PUA:                 '^PUA\\.',
+        Structured:          '^Heuristics\\.Structured\\.',
+        OLE2:                '^Heuristics\\.OLE2\\.ContainsMacros',
+        Safebrowsing:        '^Heuristics\\.Safebrowsing\\.',
+        Phishing:            '^Heuristics\\.Phishing\\.',
+        UNOFFICIAL:          '\\.UNOFFICIAL$',
+    };
+
+    var all_reject_opts = [];
+    var enabled_reject_opts = [];
+    Object.keys(rejectPatterns).forEach(function (opt) {
+        all_reject_opts.push(rejectPatterns[opt]);
+        if (!plugin.cfg.reject[opt]) return;
+        enabled_reject_opts.push(rejectPatterns[opt]);
+    });
+
+    if (enabled_reject_opts.length) {
+        plugin.allRE = new RegExp(all_reject_opts.join('|'));
+        plugin.rejectRE = new RegExp(enabled_reject_opts.join('|'));
+    }
+
     // resolve mismatch between docs (...attachment) and code (...attachments)
     if (plugin.cfg.main.only_with_attachment !== undefined) {
-        plugin.cfg.main.only_with_attachments = plugin.cfg.main.only_with_attachment ? true : false;
+        plugin.cfg.main.only_with_attachments =
+            plugin.cfg.main.only_with_attachment ? true : false;
     }
 };
 
@@ -104,11 +149,12 @@ exports.hook_data = function (next, connection) {
     var plugin = this;
     if (!plugin.cfg.main.only_with_attachments) return next();
 
-    var transaction = connection.transaction;
-    transaction.parse_body = true;
-    transaction.attachment_hooks(function (ctype, filename, body) {
-        connection.logdebug(plugin, 'found ctype=' + ctype + ', filename=' + filename);
-        transaction.notes.clamd_found_attachment = true;
+    var txn = connection.transaction;
+    txn.parse_body = true;
+    txn.attachment_hooks(function (ctype, filename, body) {
+        connection.logdebug(plugin,
+                'found ctype=' + ctype + ', filename=' + filename);
+        txn.notes.clamd_found_attachment = true;
     });
 
     return next();
@@ -116,35 +162,33 @@ exports.hook_data = function (next, connection) {
 
 exports.hook_data_post = function (next, connection) {
     var plugin = this;
-    var transaction = connection.transaction;
+    var txn = connection.transaction;
+    var cfg = plugin.cfg;
 
     // Do we need to run?
-    if (plugin.cfg.main.only_with_attachments &&
-        !transaction.notes.clamd_found_attachment)
-    {
+    if (cfg.main.only_with_attachments && !txn.notes.clamd_found_attachment) {
         connection.logdebug(plugin, 'skipping: no attachments found');
-        transaction.results.add(plugin, {skip: 'no attachments'});
+        txn.results.add(plugin, {skip: 'no attachments'});
         return next();
     }
 
     // Limit message size
-    if (transaction.data_bytes > plugin.cfg.main.max_size) {
-        transaction.results.add(plugin, {skip: 'exceeds max size', emit: true});
+    if (txn.data_bytes > cfg.main.max_size) {
+        txn.results.add(plugin, {skip: 'exceeds max size', emit: true});
         return next();
     }
 
-    var hosts = plugin.cfg.main.clamd_socket.split(/[,; ]+/);
+    var hosts = cfg.main.clamd_socket.split(/[,; ]+/);
 
-    if (plugin.cfg.main.randomize_host_order) {
+    if (cfg.main.randomize_host_order) {
         hosts.sort(function() {return 0.5 - Math.random();});
     }
 
     var try_next_host = function () {
         var connected = false;
         if (!hosts.length) {
-            if (transaction) {
-                transaction.results.add(plugin, {err: 'connecting', emit: true});
-            }
+            if (txn) txn.results.add(plugin, {err: 'connecting' });
+            if (!plugin.cfg.reject.error) return next();
             return next(DENYSOFT, 'Error connecting to virus scanner');
         }
         var host = hosts.shift();
@@ -153,40 +197,36 @@ exports.hook_data_post = function (next, connection) {
 
         socket.on('timeout', function () {
             socket.destroy();
-            if (connected) {
-                if (transaction) {
-                    transaction.results.add(plugin, {err: 'clamd timed out', emit: true});
-                }
-                return next(DENYSOFT, 'Virus scanner timed out');
-            }
-            else {
+            if (!connected) {
                 connection.logerror(plugin, 'Timeout connecting to ' + host);
-                try_next_host();
+                return try_next_host();
             }
+            if (txn) txn.results.add(plugin, {err: 'clamd timed out' });
+            if (!plugin.cfg.reject.error) return next();
+            return next(DENYSOFT, 'Virus scanner timed out');
         });
 
         socket.on('error', function (err) {
             socket.destroy();
             if (!connected) {
-                connection.logerror(plugin, 'Connection to ' + host + ' failed: ' + err.message);
-                try_next_host();
+                connection.logerror(plugin,
+                       'Connection to ' + host + ' failed: ' + err.message);
+                return try_next_host();
             }
-            else {
-                if (transaction) {
-                    transaction.results.add(plugin, {err: err, emit: true});
-                }
-                return next(DENYSOFT, 'Virus scanner error');
-            }
+
+            if (txn) txn.results.add(plugin, {err: err });
+            if (!plugin.cfg.reject.error) return next();
+            return next(DENYSOFT, 'Virus scanner error');
         });
 
         socket.on('connect', function () {
             connected = true;
-            socket.setTimeout((plugin.cfg.main.timeout || 30) * 1000);
+            socket.setTimeout((cfg.main.timeout || 30) * 1000);
             var hp = socket.address(),
               addressInfo = hp === null ? '' : ' ' + hp.address + ':' + hp.port;
             connection.logdebug(plugin, 'connected to host' + addressInfo);
             socket.write("zINSTREAM\0", function () {
-                transaction.message_stream.pipe(socket, { clamd_style: true });
+                txn.message_stream.pipe(socket, { clamd_style: true });
             });
         });
 
@@ -196,62 +236,83 @@ exports.hook_data_post = function (next, connection) {
             result = line.replace(/\r?\n/, '');
         });
 
-        socket.setTimeout((plugin.cfg.main.connect_timeout || 10) * 1000);
+        socket.setTimeout((cfg.main.connect_timeout || 10) * 1000);
 
         socket.on('end', function () {
-            if (!transaction) return next();
+            if (!txn) return next();
             if (/^stream: OK/.test(result)) {                // OK
-                transaction.results.add(plugin, {pass: 'clean', emit: true});
+                txn.results.add(plugin, {pass: 'clean', emit: true});
                 return next();
             }
+
             var m = /^stream: (\S+) FOUND/.exec(result);
             if (m) {
                 var virus;                                   // Virus found
                 if (m[1]) { virus = m[1]; }
-                transaction.results.add(plugin, {fail: 'virus' + (virus ? ('(' + virus + ')') : ''), emit: true});
+                txn.results.add(plugin, {
+                    fail: virus ? virus : 'virus',
+                    emit: true
+                });
+
+                if (virus && plugin.rejectRE &&       // enabled
+                    plugin.allRE.test(virus) &&       // has a reject option
+                    !plugin.rejectRE.test(virus)) {   // reject=false set
+                        return next();
+                }
+                if (!plugin.cfg.reject.virus) { return next(); }
 
                 // Check skip list exclusions
                 for (var i=0; i < plugin.skip_list_exclude.length; i++) {
                     if (!plugin.skip_list_exclude[i].test(virus)) continue;
-                    return next(DENY, 'Message is infected with ' + (virus || 'UNKNOWN'));
+                    return next(DENY,
+                            'Message is infected with ' + (virus || 'UNKNOWN'));
                 }
 
                 // Check skip list
                 for (var j=0; j < plugin.skip_list.length; j++) {
                     if (!plugin.skip_list[j].test(virus)) continue;
                     connection.logwarn(plugin, virus + ' matches exclusion');
-                    transaction.add_header('X-Haraka-Virus', virus);
+                    txn.add_header('X-Haraka-Virus', virus);
                     return next();
                 }
-                return next(DENY, 'Message is infected with ' + (virus || 'UNKNOWN'));
+                return next(DENY, 'Message is infected with ' +
+                        (virus || 'UNKNOWN'));
             }
+
             if (/size limit exceeded/.test(result)) {
-                var errmsg = 'INSTREAM size limit exceeded. Check StreamMaxLength in clamd.conf';
-                transaction.results.add(plugin, {err: errmsg, emit: true});
+                txn.results.add(plugin, {
+                    err: 'INSTREAM size limit exceeded. Check ' +
+                        'StreamMaxLength in clamd.conf',
+                });
                 // Continue as StreamMaxLength default is 25Mb
                 return next();
             }
 
-            transaction.results.add(plugin, {err: 'unknown result: ' + result, emit: true});
+            txn.results.add(plugin, { err: 'unknown result: ' + result });
+            if (!plugin.cfg.reject.error) return next();
             return next(DENYSOFT, 'Error running virus scanner');
         });
 
-        var match;
-        if (host.match(/^\//)) {
-            // assume unix socket
-            socket.connect(host);
-        }
-        else if ((match = /^\[([^\] ]+)\](?::(\d+))?/.exec(host))) {
-            // IPv6 literal
-            socket.connect((match[2] || 3310), match[1]);
-        }
-        else {
-            // IP:port, hostname:port or hostname
-            var hostport = host.split(/:/);
-            socket.connect((hostport[1] || 3310), hostport[0]);
-        }
+        clamd_connect(socket, host);
     };
 
     // Start the process
     try_next_host();
 };
+
+function clamd_connect (socket, host) {
+    var match;
+    if (host.match(/^\//)) {
+        // assume unix socket
+        socket.connect(host);
+    }
+    else if ((match = /^\[([^\] ]+)\](?::(\d+))?/.exec(host))) {
+        // IPv6 literal
+        socket.connect((match[2] || 3310), match[1]);
+    }
+    else {
+        // IP:port, hostname:port or hostname
+        var hostport = host.split(/:/);
+        socket.connect((hostport[1] || 3310), hostport[0]);
+    }
+}

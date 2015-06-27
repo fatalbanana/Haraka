@@ -115,8 +115,9 @@ exports.hook_data_post = function (next, connection) {
             res.on('end', function () {
                 var data = plugin.parse_response(rawData, connection);
                 if (!data) return next();
-
                 data.emit = true; // spit out a log entry
+
+                if (!connection.transaction) return next();
                 connection.transaction.results.add(plugin, data);
                 connection.transaction.results.add(plugin, {
                     time: (Date.now() - start)/1000,
@@ -140,7 +141,7 @@ exports.hook_data_post = function (next, connection) {
     );
 
     req.on('error', function (err) {
-        connection.logerror('Rspamd query failed: ' + err.message);
+        connection.logerror(plugin, 'query failed: ' + err.message);
         return next();
     });
 };

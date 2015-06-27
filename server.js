@@ -41,7 +41,8 @@ Server.load_smtp_ini = function () {
 };
 
 Server.load_http_ini = function () {
-    Server.http_cfg = config.get('http.ini', function () {
+    Server.http = {};
+    Server.http.cfg = config.get('http.ini', function () {
         Server.load_http_ini();
     }).main;
 };
@@ -128,21 +129,19 @@ Server.createServer = function (params) {
     if (!cluster || !c.nodes) {
         Server.daemonize(c);
         Server.setup_smtp_listeners(plugins, 'master', inactivity_timeout);
-        Server.setup_http_listeners(plugins, 'master');
         return;
     }
 
     // Cluster
     Server.cluster = cluster;
 
-    // Workers
+    // Cluster Workers
     if (!cluster.isMaster) {
         Server.setup_smtp_listeners(plugins, 'child', inactivity_timeout);
-        Server.setup_http_listeners(plugins, 'child');
         return;
     }
 
-    // Master
+    // Cluster Master
     // We fork workers in init_master_respond so that plugins
     // can put handlers on cluster events before they are emitted.
     plugins.run_hooks('init_master', Server);
@@ -195,7 +194,8 @@ Server.setup_smtp_listeners = function (plugins, type, inactivity_timeout) {
 
         var hp = /^\[?([^\]]+)\]?:(\d+)$/.exec(host_port);
         if (!hp) {
-            return cb(new Error("Invalid format for listen parameter in smtp.ini"));
+            return cb(new Error(
+                        'Invalid format for listen parameter in smtp.ini'));
         }
         var host = hp[1];
         var port = hp[2];
@@ -215,7 +215,9 @@ Server.setup_smtp_listeners = function (plugins, type, inactivity_timeout) {
         // Fallback from IPv6 to IPv4 if not supported
         // But only if we supplied the default of [::0]:25
         server.on('error', function (e) {
-            if (e.code === 'EAFNOSUPPORT' && /^::0/.test(host) && Server.default_host) {
+            if (e.code === 'EAFNOSUPPORT' &&
+                    /^::0/.test(host) &&
+                    Server.default_host) {
                 server.listen(port, '0.0.0.0');
             }
             else {
@@ -230,31 +232,26 @@ Server.setup_smtp_listeners = function (plugins, type, inactivity_timeout) {
     async.each(listeners, setupListener, runInitHooks);
 };
 
-Server.setup_http_listeners = function (plugins, type) {
-    if (!Server.http_cfg) return;
-    if (!Server.http_cfg.listen) return;
+Server.setup_http_listeners = function () {
+    if (!Server.http.cfg) return;
+    if (!Server.http.cfg.listen) return;
 
-    var listeners = Server.get_listen_addrs(Server.http_cfg, 80);
+    var listeners = Server.get_listen_addrs(Server.http.cfg, 80);
     if (!listeners.length) return;
 
-    var express;
     try {
-        express = require('express');
+        Server.http.express = require('express');
+        logger.loginfo('express loaded at Server.http.express');
     }
     catch (err) {
         logger.logerror('express failed to load. No http server. ' +
                 ' Try installing express with: npm install -g express');
         return;
     }
-    var app = express();
-    var server, wss;
 
-    Server.init_http_respond = function () {
-        // logger.loginfo(arguments);
-    };
-    Server.init_wss_respond = function () {
-        // logger.loginfo(arguments);
-    };
+    var app = Server.http.express();
+    Server.http.app = app;
+    logger.loginfo('express app is at Server.http.app');
 
     var setupListener = function (host_port, cb) {
         var hp = /^\[?([^\]]+)\]?:(\d+)$/.exec(host_port);
@@ -262,17 +259,20 @@ Server.setup_http_listeners = function (plugins, type) {
             return cb(new Error('Invalid format for listen in http.ini'));
         }
 
-        server = require('http').createServer(app);
+        Server.http.server = require('http').createServer(app);
 
-        server.on('listening', function () {
+        Server.http.server.on('listening', function () {
             var addr = this.address();
             logger.lognotice('Listening on ' + addr.address + ':' + addr.port);
             cb();
         });
 
-        server.on('error', function (e) { cb(e); });
+        Server.http.server.on('error', function (e) {
+            logger.logerror(e);
+            cb(e);
+        });
 
-        server.listen(hp[2], hp[1]);
+        Server.http.server.listen(hp[2], hp[1]);
     };
 
     var registerRoutes = function (err) {
@@ -280,21 +280,8 @@ Server.setup_http_listeners = function (plugins, type) {
             logger.logerror('Failed to setup http routes: ' + err.message);
         }
 
-        plugins.run_hooks('init_http', Server, app);
-
-        var WebSocketServer;
-        try { WebSocketServer = require('ws').Server; }
-        catch (e) {
-            logger.logerror('unable to load ws.\ndid you: npm install -g ws?');
-        }
-
-        if (WebSocketServer) {
-            wss = new WebSocketServer({ server: server });
-            plugins.run_hooks('init_wss', Server, wss);
-        }
-
-        app.get('/plugins', Server.http_plugins);
-        app.use(express.static(Server.get_http_docroot()));
+        plugins.run_hooks('init_http', Server);
+        app.use(Server.http.express.static(Server.get_http_docroot()));
         app.use(Server.handle404);
     };
 
@@ -303,7 +290,8 @@ Server.setup_http_listeners = function (plugins, type) {
 
 Server.init_master_respond = function (retval, msg) {
     if (!(retval === constants.ok || retval === constants.cont)) {
-        Server.logerror("init_master returned error" + ((msg) ? ': ' + msg : ''));
+        Server.logerror("init_master returned error" +
+                ((msg) ? ': ' + msg : ''));
         process.exit(1);
     }
 
@@ -313,64 +301,78 @@ Server.init_master_respond = function (retval, msg) {
     // Load the queue if we're just one process
     if (!(cluster && c.nodes)) {
         out.load_queue();
+        Server.setup_http_listeners();
+        return;
     }
-    else {
-        // Running under cluster, fork children here, so that
-        // cluster events can be registered in init_master hooks.
-        out.scan_queue_pids(function (err, pids) {
-            if (err) {
-                Server.logcrit("Scanning queue failed. Shutting down.");
-                process.exit(1);
-            }
-            Server.daemonize();
-            // Fork workers
-            var workers = (c.nodes === 'cpus') ?
-                os.cpus().length : c.nodes;
-            var new_workers = [];
-            for (var i=0; i<workers; i++) {
-                new_workers.push(cluster.fork({ CLUSTER_MASTER_PID: process.pid }));
-            }
-            for (var i=0; i<pids.length; i++) {
-                new_workers[i % new_workers.length].send({event: 'outbound.load_pid_queue', data: pids[i]});
-            }
-            cluster.on('online', function (worker) {
-                logger.lognotice('worker ' + worker.id + ' started pid=' + worker.process.pid);
-            });
-            cluster.on('listening', function (worker, address) {
-                logger.lognotice('worker ' + worker.id + ' listening on ' + address.address + ':' + address.port);
-            });
-            cluster.on('exit', function (worker, code, signal) {
-                if (signal) {
-                    logger.lognotice('worker ' + worker.id + ' killed by signal ' + signal);
-                }
-                else if (code !== 0) {
-                    logger.lognotice('worker ' + worker.id + ' exited with error code: ' + code);
-                }
-                if (signal || code !== 0) {
-                    // Restart worker
-                    var new_worker = cluster.fork({ CLUSTER_MASTER_PID: process.pid });
-                    new_worker.send({event: 'outbound.load_pid_queue', data: worker.process.pid});
-                }
-            });
+
+    // Running under cluster, fork children here, so that
+    // cluster events can be registered in init_master hooks.
+    out.scan_queue_pids(function (err, pids) {
+        if (err) {
+            Server.logcrit("Scanning queue failed. Shutting down.");
+            process.exit(1);
+        }
+        Server.daemonize();
+        // Fork workers
+        var workers = (c.nodes === 'cpus') ? os.cpus().length : c.nodes;
+        var new_workers = [];
+        for (var i=0; i<workers; i++) {
+            new_workers.push(cluster.fork({ CLUSTER_MASTER_PID: process.pid }));
+        }
+        for (var j=0; j<pids.length; j++) {
+            new_workers[j % new_workers.length]
+                .send({event: 'outbound.load_pid_queue', data: pids[j]});
+        }
+        cluster.on('online', function (worker) {
+            logger.lognotice('worker ' + worker.id + ' started pid=' +
+                    worker.process.pid);
         });
-    }
+        cluster.on('listening', function (worker, address) {
+            logger.lognotice('worker ' + worker.id + ' listening on ' +
+                    address.address + ':' + address.port);
+        });
+        cluster.on('exit', function (worker, code, signal) {
+            if (signal) {
+                logger.lognotice('worker ' + worker.id +
+                        ' killed by signal ' + signal);
+            }
+            else if (code !== 0) {
+                logger.lognotice('worker ' + worker.id +
+                        ' exited with error code: ' + code);
+            }
+            if (signal || code !== 0) {
+                // Restart worker
+                var new_worker = cluster.fork({
+                    CLUSTER_MASTER_PID: process.pid
+                });
+                new_worker.send({
+                    event: 'outbound.load_pid_queue', data: worker.process.pid,
+                });
+            }
+        });
+    });
 };
 
 Server.init_child_respond = function (retval, msg) {
-    if (!(retval === constants.ok || retval === constants.cont)) {
-        var pid = process.env.CLUSTER_MASTER_PID;
-        Server.logerror("init_child returned error" + ((msg) ? ': ' + msg : ''));
-        try {
-            if (pid) {
-                process.kill(pid);
-                Server.logerror('Killing master (pid=' + pid + ')');
-            }
-        }
-        catch (err) {
-            Server.logerror('Terminating child');
-        }
-        process.exit(1);
+    switch (retval) {
+        case constants.ok:
+        case constants.cont:
+            Server.setup_http_listeners();
+            return;
     }
+
+    var pid = process.env.CLUSTER_MASTER_PID;
+    Server.logerror("init_child returned error" + ((msg) ? ': ' + msg : ''));
+    try {
+        if (pid) {
+            process.kill(pid);
+            Server.logerror('Killing master (pid=' + pid + ')');
+        }
+    }
+    catch (err) {
+        Server.logerror('Terminating child');
+    }
+    process.exit(1);
 };
 
 Server.listening = function () {
@@ -391,15 +393,41 @@ Server.listening = function () {
     Server.ready = 1;
 };
 
-Server.get_http_docroot = function () {
-    if (Server.http_cfg.docroot) return Server.http_cfg.docroot;
+Server.init_http_respond = function () {
+    logger.loginfo('init_http_respond');
 
-    Server.http_cfg.docroot = path.join(
+    var WebSocketServer;
+    try { WebSocketServer = require('ws').Server; }
+    catch (e) {
+        logger.logerror('unable to load ws.\ndid you: npm install -g ws?');
+        return;
+    }
+
+    if (!WebSocketServer) {
+        logger.logerror('ws failed to load');
+        return;
+    }
+
+    Server.http.wss = new WebSocketServer({ server: Server.http.server });
+    logger.loginfo('Server.http.wss loaded');
+
+    plugins.run_hooks('init_wss', Server);
+};
+
+Server.init_wss_respond = function () {
+    logger.loginfo('init_wss_respond');
+    // logger.logdebug(arguments);
+};
+
+Server.get_http_docroot = function () {
+    if (Server.http.cfg.docroot) return Server.http.cfg.docroot;
+
+    Server.http.cfg.docroot = path.join(
         (process.env.HARAKA || __dirname),
         '/html'
     );
-    logger.loginfo('using html docroot: ' + Server.http_cfg.docroot);
-    return Server.http_cfg.docroot;
+    logger.loginfo('using html docroot: ' + Server.http.cfg.docroot);
+    return Server.http.cfg.docroot;
 };
 
 Server.handle404 = function(req, res){
@@ -419,8 +447,4 @@ Server.handle404 = function(req, res){
     }
 
     res.status(404).send('Not found!');
-};
-
-Server.http_plugins = function(req, res) {
-    return res.json({ plugins: Server.hooks_to_run });
 };

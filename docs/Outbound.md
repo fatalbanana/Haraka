@@ -57,6 +57,11 @@ session. When `always_split` is enabled, each recipient gets a queue entry and
 delivery in its own SMTP session. This carries a performance penalty but
 enables more flexibility in mail delivery and bounce handling.
 
+* `received_header`
+
+Default: "Haraka outbound". This text is attached as a `Received` header to
+all outbound mail just before it is queued.
+
 ### outbound.bounce\_message
 
 See "Bounce Messages" below for details.
@@ -266,5 +271,5 @@ successfully delivered.
 The callback parameter may be omitted if you don't need to handle errors
 should queueing to disk fail e.g:
 
-    outbound.send_email(form, to, contents);
+    outbound.send_email(from, to, contents);
 

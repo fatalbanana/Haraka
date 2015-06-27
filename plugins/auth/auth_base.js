@@ -83,12 +83,16 @@ exports.check_user = function (next, connection, credentials, method) {
         return;
     }
 
-    var passwd_ok = function (valid) {
+    var passwd_ok = function (valid, message) {
         if (valid) {
             connection.relaying = true;
-            connection.results.add({name:'relay'}, {pass: 'auth'});
-            connection.results.add(plugin, {pass: method});
-            connection.respond(235, "Authentication successful", function () {
+            connection.results.add({name:'relay'}, {pass: plugin.name});
+            connection.results.add({name:'auth'}, {
+                pass: plugin.name,
+                method: method,
+                user: credentials[0],
+            });
+            connection.respond(235, ((message) ? message : "Authentication successful"), function () {
                 connection.authheader = "(authenticated bits=0)\n";
                 connection.auth_results('auth=pass (' +
                             method.toLowerCase() + ')' );
@@ -103,7 +107,9 @@ exports.check_user = function (next, connection, credentials, method) {
             connection.notes.auth_fails = 0;
         }
         connection.notes.auth_fails++;
-        connection.results.add(plugin, {fail: method});
+        connection.results.add({name: 'auth'}, {
+            fail: plugin.name + '/' + method,
+        });
 
         connection.notes.auth_login_userlogin = null;
         connection.notes.auth_login_asked_login = false;
@@ -117,7 +123,7 @@ exports.check_user = function (next, connection, credentials, method) {
         connection.auth_results('auth=fail (' + method.toLowerCase() +
                     ') smtp.auth='+ credentials[0]);
         setTimeout(function () {
-            connection.respond(535, "Authentication failed", function () {
+            connection.respond(535, ((message) ? message : "Authentication failed"), function () {
                 connection.reset_transaction(function () {
                     return next(OK);
                 });
