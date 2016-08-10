@@ -221,7 +221,10 @@ exports.parse_response = function (rawData, connection) {
             case 'object':
                 // transform { name: KEY, score: VAL } -> { KEY: VAL }
                 if (a.name && a.score !== undefined) {
-                    dataClean[ a.name ] = a.score;
+                    if (dataClean.symbols === undefined) {
+                        dataClean.symbols = {};
+                    }
+                    dataClean.symbols[ a.name ] = a.score;
                     break;
                 }
                 // unhandled type
@@ -282,11 +285,8 @@ exports.add_headers = function (connection, data) {
 
     if (cfg.header && cfg.header.report) {
         var prettySymbols = [];
-        for (var k in data) {
-            if (data[k].score) {
-                prettySymbols.push(data[k].name +
-                    '(' + data[k].score + ')');
-            }
+        for (var k in data.symbols) {
+            prettySymbols.push(k + ' (' + data.symbols[k] + ')');
         }
         connection.transaction.remove_header(cfg.header.report);
         connection.transaction.add_header(cfg.header.report,
