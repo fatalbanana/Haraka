@@ -131,7 +131,9 @@ exports.hook_data_post = function (next, connection) {
     }
 
     timer = setTimeout(function () {
-        connection.transaction.results.add(plugin, {err: 'timeout'});
+        if (connection.transaction) {
+            connection.transaction.results.add(plugin, {err: 'timeout'});
+        }
         callNext();
     }, timeout * 1000);
 
